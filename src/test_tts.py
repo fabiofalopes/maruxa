@@ -3,7 +3,7 @@ import os
 import asyncio
 from rich.console import Console
 from rich.prompt import Prompt
-from tts.edge_tts_integration import create_audio
+from tts.edge_tts_wrapper import EdgeTTSWrapper
 from playback.playback_module import play_audio
 from config.config import VOICE_OUTPUTS_DIR
 
@@ -23,7 +23,7 @@ def main():
         
         if choice == "1":
             text = Prompt.ask("Enter the text you want to convert to speech")
-            audio_file = create_audio(text)
+            audio_file = EdgeTTSWrapper.generate_audio(text)
             if audio_file:
                 console.print(f"Playing audio: [green]{audio_file}[/green]")
                 play_audio(audio_file)

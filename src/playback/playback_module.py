@@ -8,8 +8,20 @@ from rich.console import Console
 from rich.progress import Progress
 from typing import Optional
 import numpy as np
+import queue
+from pydub import AudioSegment
+import io
+import logging
+import ffmpeg
+import subprocess
+from .streaming import AudioStreamer
+from .file_playback import FileAudioController
+
+logger = logging.getLogger(__name__)
 
 class AudioController:
+    """Main audio controller handling both streaming and file playback"""
+    
     def __init__(self):
         self.console = Console()
         self.is_playing = False
@@ -22,7 +34,18 @@ class AudioController:
         self.paused = False
         self.should_stop = False
         self.listener = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self.streaming_buffer = queue.Queue()
+        self.streaming_active = False
+        self.current_stream = None
+        self._ffmpeg_process = None
+        self._ffmpeg_stdin = None
+        self._ffmpeg_stdout = None
+        self.streamer = AudioStreamer()
+        self.file_player = FileAudioController()
+        self.active_mode = None  # 'stream' or 'file'
+        self._playback_complete = threading.Event()
+        self._playback_thread = None
 
     def cleanup(self):
         """Clean up audio resources and reset state."""
@@ -53,110 +76,120 @@ class AudioController:
             self.paused = False
             self.should_stop = False
 
-    def play_audio(self, audio_file: str):
-        """Start playing audio with controls"""
-        # Clean up any existing playback
-        self.cleanup()
-        
+    async def play_audio(self, file_path: str):
+        """Async wrapper for audio playback"""
+        with self._lock:
+            self.stop_all()
+            self._playback_complete.clear()
+            self.active_mode = 'file'
+            self._start_listener()
+            self.is_playing = True
+            self.should_stop = False
+            
+            # Play audio directly in the file player
+            self.file_player.play_audio_file(file_path)
+            self.samplerate = self.file_player.samplerate
+            self.total_frames = self.file_player.total_frames
+            self.current_frame = 0
+
+    def _run_file_playback(self, file_path):
+        """Blocking file playback runner"""
         try:
-            # Load the audio file
-            self.data, self.samplerate = sf.read(audio_file)
-            self.total_frames = len(self.data)
+            self.file_player.play_audio_file(file_path)
+            self.samplerate = self.file_player.samplerate
+            self.total_frames = self.file_player.total_frames
             self.current_frame = 0
             self.is_playing = True
-            self.is_paused = False
+            self.file_player.wait_for_completion()
+        finally:
+            self.is_playing = False
+            self._playback_complete.set()
 
-            # Print controls before progress bar
-            self.console.print("\nPlaying Audio Response")
-            self.console.print("\nControls:")
-            self.console.print("p: Pause/Resume | q: Stop")
-            self.console.print("a/d: Skip ±1s | w/s: Skip ±10s\n")
+    def stop_file_playback(self):
+        if self.active_mode == 'file':
+            self.file_player.stop()
+            self.active_mode = None
+
+    def stop_all(self):
+        """Stop all playback immediately"""
+        with self._lock:
+            self.is_playing = False
+            self.should_stop = True
+            self.file_player.stop()
+            self.streamer.stop_stream()
+            self.active_mode = None
             
-            with Progress() as progress:
-                task = progress.add_task("", total=100)
-                
-                # Start keyboard listener
-                self.listener = keyboard.Listener(on_press=self.on_press)
-                self.listener.start()
-                
-                try:
-                    def callback(outdata, frames, time, status):
-                        if status:
-                            self.console.print(f"[red]Status: {status}[/red]")
-                        
-                        if self.is_paused:
-                            outdata.fill(0)
-                            return
-                        
-                        if self.current_frame + frames > len(self.data):
-                            remaining = len(self.data) - self.current_frame
-                            if remaining > 0:
-                                data_chunk = self.data[self.current_frame:len(self.data)]
-                                outdata[:remaining, 0] = data_chunk
-                                outdata[remaining:] = 0
-                            else:
-                                outdata.fill(0)
-                            self.is_playing = False
-                            raise sd.CallbackStop()
-                        else:
-                            data_chunk = self.data[self.current_frame:self.current_frame + frames]
-                            outdata[:, 0] = data_chunk
-                            self.current_frame += frames
-                            progress.update(task, completed=(self.current_frame / len(self.data)) * 100)
+            if self.listener:
+                self.listener.stop()
+                self.listener = None
+            
+            if self._playback_thread and self._playback_thread.is_alive():
+                self._playback_thread.join(timeout=0.5)
 
-                    # Create and start the stream
-                    self.stream = sd.OutputStream(
-                        samplerate=self.samplerate,
-                        channels=1,
-                        callback=callback
-                    )
+    def start_streaming_playback(self, samplerate: int):
+        self.active_mode = 'stream'
+        self.streamer.start_stream(samplerate)
 
-                    with self.stream:
-                        while self.is_playing and not self.should_stop:
-                            sd.sleep(100)  # More efficient than time.sleep
+    def add_audio_chunk(self, chunk: bytes):
+        if self.active_mode == 'stream':
+            self.streamer.add_audio_data(chunk)
 
-                finally:
-                    self.cleanup()
-
-        except Exception as e:
-            self.console.print(f"[red]Error playing audio: {str(e)}[/red]")
-            self.cleanup()
+    def stop_streaming(self):
+        if self.active_mode == 'stream':
+            self.streamer.stop_stream()
+            self.active_mode = None
 
     def _skip_frames(self, frames):
         """Skip forward or backward in the audio"""
-        new_position = self.current_frame + frames
-        if 0 <= new_position < self.total_frames:
-            self.current_frame = new_position
-            skip_seconds = frames / self.samplerate
-            direction = "→" if frames > 0 else "←"
-            self.console.print(f"[dim]{direction} {abs(skip_seconds)}s[/dim]")
+        if not self.samplerate or self.active_mode != 'file':
+            return
+            
+        with self._lock:
+            new_position = self.file_player.current_frame + frames
+            if 0 <= new_position < self.file_player.total_frames:
+                self.file_player.seek(new_position / self.samplerate)
+                self.current_frame = new_position
+                direction = "→" if frames > 0 else "←"
+                self.console.print(f"[dim]{direction} {abs(frames/self.samplerate):.1f}s[/dim]")
 
     def _toggle_pause(self):
         """Toggle pause/resume"""
-        self.is_paused = not self.is_paused
-        status = "⏸ Paused" if self.is_paused else "▶ Resumed"
-        self.console.print(f"[dim]{status}[/dim]")
+        with self._lock:
+            if self.active_mode == 'file':
+                is_paused = self.file_player.toggle_pause()
+                self.is_paused = is_paused
+                status = "⏸ Paused" if is_paused else "▶ Resumed"
+                self.console.print(f"[dim]{status}[/dim]")
 
     def _stop(self):
         """Stop playback"""
-        self.is_playing = False
-        self.console.print("[dim]⏹ Stopped[/dim]")
+        with self._lock:
+            self.is_playing = False
+            self.should_stop = True
+            self.stop_all()
+            self.console.print("[dim]⏹ Stopped[/dim]")
 
     def on_press(self, key):
         try:
-            if hasattr(key, 'char'):  # Regular keys
-                if key.char == 'p':
-                    self._toggle_pause()
-                elif key.char == 'q':
-                    self._stop()
-                elif key.char == 'a':
-                    self._skip_frames(-int(self.samplerate))  # Back 1s
-                elif key.char == 'd':
-                    self._skip_frames(int(self.samplerate))   # Forward 1s
-                elif key.char == 's':
-                    self._skip_frames(-int(self.samplerate * 10))  # Back 10s
-                elif key.char == 'w':
-                    self._skip_frames(int(self.samplerate * 10))   # Forward 10s
+            if not self.is_playing:
+                return
+            
+            if hasattr(key, 'char'):
+                with self._lock:
+                    match key.char:
+                        case 'p':
+                            self._toggle_pause()
+                        case 'a':
+                            self._skip_frames(-int(self.samplerate))
+                        case 'd':
+                            self._skip_frames(int(self.samplerate))
+                        case 's':
+                            self._skip_frames(-int(self.samplerate * 10))
+                        case 'w':
+                            self._skip_frames(int(self.samplerate * 10))
+                        case 'q':
+                            self.should_stop = True
+                            self._stop()
         except AttributeError:
             pass
 
@@ -167,13 +200,48 @@ class AudioController:
         except Exception:
             pass
 
-# Create a singleton instance
-audio_controller = AudioController()
+    def _stream_callback(self, outdata, frames, time, status):
+        """Audio output callback with error handling"""
+        try:
+            if status:
+                logger.warning(f"Audio stream status: {status}")
+            
+            pcm_data = self._ffmpeg_process.stdout.read(frames * 4)
+            if pcm_data:
+                audio_array = np.frombuffer(pcm_data, dtype=np.float32)
+                outdata[:] = audio_array.reshape(-1, 1)
+            else:
+                outdata.fill(0)
+                if not self.streaming_active:
+                    raise sd.CallbackStop()
+            
+        except Exception as e:
+            logger.error(f"Audio callback error: {str(e)}")
+            raise sd.CallbackAbort from e
 
-# Function to maintain backward compatibility
-def play_audio(audio_file: str):
-    """Backward compatible function for playing audio"""
-    audio_controller.play_audio(audio_file)
+    def wait_for_playback(self):
+        """Non-blocking wait for playback completion"""
+        while self.is_playing and not self.should_stop:
+            if self.active_mode == 'file':
+                if not self.file_player.is_playing:
+                    self.is_playing = False
+                    break
+            time.sleep(0.05)  # Reduced sleep time
+
+    def _start_listener(self):
+        """Start keyboard listener if not already running"""
+        if not self.listener or not self.listener.is_alive():
+            self.listener = keyboard.Listener(on_press=self.on_press)
+            self.listener.start()
+
+    def update_progress(self):
+        """Update current frame from file player"""
+        if self.active_mode == 'file':
+            self.current_frame = self.file_player.current_frame
+
+# Maintain backward compatibility
+audio_controller = AudioController()
+play_audio = audio_controller.play_audio
 
 # Export both the class and the function
 __all__ = ['AudioController', 'audio_controller', 'play_audio']

@@ -1,17 +1,21 @@
 from typing import Optional
 from rich.console import Console
 from rich.progress import Progress
+from rich.live import Live
 from llama_index.core.llms import ChatMessage
-from tts.edge_tts_integration import EdgeTTS
+from tts.edge_tts_wrapper import EdgeTTSWrapper
 from llm.groq_llm import GroqLLMWrapper
 from utils.index_manager import IndexManager
 from playback.playback_module import audio_controller
+from ui.playback_ui import PlaybackDisplay
 import os
+import asyncio
+from pynput import keyboard
 
 class TextAssistantWorkflow:
     def __init__(self, index_manager: IndexManager):
         self.console = Console()
-        self.tts = EdgeTTS()
+        self.tts = EdgeTTSWrapper()
         self.llm_wrapper = GroqLLMWrapper()
         self.index_manager = index_manager
         self.audio_controller = audio_controller
@@ -48,14 +52,33 @@ class TextAssistantWorkflow:
                     response_text = str(rag_response)
                     self.console.print(f"\n[green]Response:[/green] {response_text}")
                     
-                    # Convert to speech
+                    # Stop query progress before audio playback
                     progress.stop()
-                    audio_file = await self.tts.create_audio(response_text)
+                    
+                    # Convert to speech
+                    audio_file = await self.tts.generate_audio(response_text)
                     if audio_file:
                         try:
-                            self.audio_controller.play_audio(audio_file)
+                            await self.audio_controller.play_audio(audio_file)
+                            display = PlaybackDisplay(self.audio_controller)
+                            
+                            with Live(display.live_display(), refresh_per_second=20) as live:
+                                while self.audio_controller.is_playing and not self.audio_controller.should_stop:
+                                    display.update()
+                                    live.update(display.live_display())
+                                    await asyncio.sleep(0.05)
+                                
+                                # Only show replay option if playback wasn't stopped with 'q'
+                                if not self.audio_controller.should_stop:
+                                    self.console.print("\n[dim]Press 'r' to replay, or Enter to continue[/dim]")
+                                    response = await asyncio.get_event_loop().run_in_executor(None, input)
+                                    
+                                    if response.lower() == 'r':
+                                        await self.audio_controller.play_audio(audio_file)
                         except Exception as e:
                             self.console.print(f"[red]Error playing audio: {str(e)}[/red]")
+                        finally:
+                            self.audio_controller.stop_all()
                 except Exception as e:
                     progress.update(task, completed=True)
                     self.console.print(f"[red]Error processing query: {str(e)}[/red]")

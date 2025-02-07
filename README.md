@@ -146,6 +146,19 @@ python src/main.py
 - FFmpeg must be available in your system PATH
 - Audio files are temporarily stored in the 'recordings' directory
 
+## Real-time Streaming Notes
+
+- Requires FFmpeg 5.0+ with MP3 codec support
+- Minimum system requirements:
+  - 2GB free memory
+  - Audio device supporting 24kHz/32-bit float output
+- Streaming latency should be <200ms when properly configured
+
+For development:
+- Use `debug_audio.mp3` to verify TTS output
+- Monitor CPU usage during streaming
+- Test with various text lengths (1-500 characters)
+
 ---
 
 
@@ -195,3 +208,13 @@ To maintain a clean and efficient codebase, we've removed and reviewed several u
 By adhering to these cleanup steps, we aim to enhance the maintainability and performance of the project.
 
 ---
+
+
+# Copy code tree 
+
+```bash
+
+ tree -a -I ".*" --dirsfirst -L 4 -I notes/ -I venv/ -I __pycache__  | to_clip
+
+```
+
